@@ -15,6 +15,10 @@ import (
 	"github.com/cilium/ebpf/internal/unix"
 )
 
+var (
+	readTimeout = 250 * time.Millisecond
+)
+
 func TestMain(m *testing.M) {
 	err := unix.Setrlimit(8, &unix.Rlimit{
 		Cur: unix.RLIM_INFINITY,
@@ -295,6 +299,82 @@ func TestReadRecord(t *testing.T) {
 	_, err = readRecord(&buf, 0)
 	if !IsUnknownEvent(err) {
 		t.Error("readRecord should return unknown event error, got", err)
+	}
+}
+
+func TestMute(t *testing.T) {
+	prog, events := mustOutputSamplesProg(t, 5)
+	defer prog.Close()
+	defer events.Close()
+
+	rd, err := NewReader(events, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rd.Close()
+
+	// Reader is already unmuted by default. It should be idempotent.
+	if err = rd.Unmute(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a sample. The reader should read it.
+	ret, _, err := prog.Test(make([]byte, 14))
+	if err != nil || ret != 0 {
+		t.Fatal("Can't write sample")
+	}
+	if _, err := rd.Read(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mute. No notification should trigger.
+	if err = rd.Mute(); err != nil {
+		t.Fatal(err)
+	}
+	errChan := make(chan error)
+	go func() {
+		// Read one notification then send any errors and exit.
+		_, err := rd.Read()
+		errChan <- err
+		close(errChan)
+	}()
+	ret, _, err = prog.Test(make([]byte, 14))
+	if err == nil && ret == 0 {
+		t.Fatal("Unexpectedly rote sample while muted")
+	} // else Success
+	select {
+	case err, ok := <-errChan:
+		// Failure: Mute was unsuccessful.
+		if ok {
+			t.Fatal(err)
+		} else {
+			t.Fatal("received notification on muted reader")
+		}
+	case <-time.After(readTimeout):
+		// Success
+	}
+
+	// Mute should be idempotent.
+	if err = rd.Mute(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unmute. Now notifications should resume.
+	if err = rd.Unmute(); err != nil {
+		t.Fatal(err)
+	}
+	ret, _, err = prog.Test(make([]byte, 14))
+	if err != nil || ret != 0 {
+		t.Fatal("Can't write sample")
+	}
+	select {
+	case err, ok := <-errChan:
+		if ok && err != nil {
+			// Actual error in reading
+			t.Fatal(err)
+		} // else Success
+	case <-time.After(readTimeout):
+		t.Fatal("timed out waiting for notification after unmute")
 	}
 }
 
